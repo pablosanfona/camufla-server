@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: camufla-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+    disk:
+      name: uploads
+      mountPath: /tmp/uploads
+      sizeGB: 1
