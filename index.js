@@ -68,23 +68,16 @@ app.post('/processar', upload.fields([
       throw new Error('Arquivo de saída não foi gerado');
     }
 
-    console.log('Concluído:', outputName);
+    const tamanho = fs.statSync(outputPath).size;
+    console.log('Concluído:', outputName, '| Tamanho:', Math.round(tamanho/1024/1024) + 'MB');
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', 'attachment; filename="' + outputName + '"');
 
     const stream = fs.createReadStream(outputPath);
     stream.pipe(res);
-    stream.on('end', () => {
-      limpar(inputPath);
-      limpar(outputPath);
-      if (capaFile) limpar(capaFile.path);
-    });
-    stream.on('error', () => {
-      limpar(inputPath);
-      limpar(outputPath);
-      if (capaFile) limpar(capaFile.path);
-    });
+    stream.on('end', () => { limpar(inputPath); limpar(outputPath); if (capaFile) limpar(capaFile.path); });
+    stream.on('error', () => { limpar(inputPath); limpar(outputPath); if (capaFile) limpar(capaFile.path); });
 
   } catch (err) {
     console.error('Erro:', err.message);
@@ -98,83 +91,123 @@ app.post('/processar', upload.fields([
 });
 
 // ============================================
-// SEM CAPA — simples e direto
+// SEM CAPA
+// FIX: bitrate controlado + áudio sincronizado
 // ============================================
 function processarSemCapa(inputPath, outputPath, nivel) {
   return new Promise((resolve, reject) => {
-    const crf = nivel === 'basica' ? 28 : nivel === 'normal' ? 26 : 24;
-    let vf = 'noise=alls=1:allf=t';
-    if (nivel === 'normal')    vf = 'noise=alls=2:allf=t,hue=s=1.01';
-    if (nivel === 'agressiva') vf = 'noise=alls=3:allf=t,hue=s=1.02';
 
-    ffmpeg(inputPath)
-      .videoFilters(vf)
-      .outputOptions([
-        '-map_metadata', '-1',
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', String(crf),
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-movflags', '+faststart',
-        '-y'
-      ])
-      .on('start', cmd => console.log('FFmpeg sem capa iniciado'))
-      .on('end', resolve)
-      .on('error', reject)
-      .save(outputPath);
+    // Detectar bitrate original para manter tamanho similar
+    ffmpeg.ffprobe(inputPath, function(err, metadata) {
+      if (err) { reject(err); return; }
+
+      const vStream = metadata.streams.find(s => s.codec_type === 'video');
+      const aStream = metadata.streams.find(s => s.codec_type === 'audio');
+      const origBitrate = vStream ? Math.round(parseInt(vStream.bit_rate || '1000000') / 1000) : 1000;
+      const targetBitrate = Math.min(origBitrate + 100, 2000); // ligeiramente maior que original
+
+      let vf = 'noise=alls=1:allf=t';
+      if (nivel === 'normal')    vf = 'noise=alls=2:allf=t,hue=s=1.01';
+      if (nivel === 'agressiva') vf = 'noise=alls=3:allf=t,hue=s=1.02';
+
+      console.log('Bitrate original:', origBitrate + 'k', '| Target:', targetBitrate + 'k');
+
+      const cmd = ffmpeg(inputPath)
+        .videoFilters(vf)
+        .outputOptions([
+          '-map_metadata', '-1',
+          '-c:v', 'libx264',
+          '-preset', 'fast',        // FIX: fast é melhor que ultrafast para qualidade/tamanho
+          '-b:v', targetBitrate + 'k', // FIX: controla bitrate para não inflar o arquivo
+          '-c:a', 'aac',
+          '-b:a', '96k',
+          '-async', '1',            // FIX: sincroniza áudio com vídeo
+          '-vsync', '1',            // FIX: sincroniza frames de vídeo
+          '-movflags', '+faststart',
+          '-y'
+        ]);
+
+      // Só adiciona mapa de áudio se existir stream de áudio
+      if (aStream) {
+        cmd.outputOptions(['-map', '0:v:0', '-map', '0:a:0']);
+      } else {
+        cmd.outputOptions(['-map', '0:v:0', '-an']);
+      }
+
+      cmd
+        .on('start', () => console.log('FFmpeg sem capa iniciado'))
+        .on('progress', p => { if (p.percent) console.log(Math.round(p.percent) + '%'); })
+        .on('end', resolve)
+        .on('error', reject)
+        .save(outputPath);
+    });
   });
 }
 
 // ============================================
 // COM CAPA — overlay nos primeiros 0.3s
-// Áudio do vídeo original preservado 100%
+// FIX: áudio sincronizado + tamanho controlado
 // ============================================
 function processarComCapa(inputPath, outputPath, nivel, capaPath) {
   return new Promise((resolve, reject) => {
 
-    // Detectar resolução do vídeo
     ffmpeg.ffprobe(inputPath, function(err, metadata) {
       if (err) { reject(err); return; }
 
-      const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-      const width  = videoStream ? videoStream.width  : 1080;
-      const height = videoStream ? videoStream.height : 1920;
+      const vStream = metadata.streams.find(s => s.codec_type === 'video');
+      const aStream = metadata.streams.find(s => s.codec_type === 'audio');
+      const width   = vStream ? vStream.width  : 1080;
+      const height  = vStream ? vStream.height : 1920;
+      const origBitrate   = vStream ? Math.round(parseInt(vStream.bit_rate || '1000000') / 1000) : 1000;
+      const targetBitrate = Math.min(origBitrate + 100, 2000);
+      const temAudio = !!aStream;
 
-      console.log('Resolução:', width + 'x' + height);
+      console.log('Resolução:', width + 'x' + height, '| Áudio:', temAudio, '| Bitrate target:', targetBitrate + 'k');
 
-      const crf = nivel === 'basica' ? 28 : nivel === 'normal' ? 26 : 24;
       let ruido = 'noise=alls=1:allf=t';
       if (nivel === 'normal')    ruido = 'noise=alls=2:allf=t,hue=s=1.01';
       if (nivel === 'agressiva') ruido = 'noise=alls=3:allf=t,hue=s=1.02';
 
-      // Usar overlay da capa nos primeiros 0.3 segundos
-      // O vídeo original fica como base — áudio preservado
-      const capaFiltro = `[1:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2[capa];[0:v]${ruido}[vid];[vid][capa]overlay=0:0:enable='between(t,0,0.3)'[out]`;
+      // Filtro complexo: aplica ruído + overlay da capa nos primeiros 0.3s
+      const complexFilter = [
+        // Prepara capa escalada para mesma resolução do vídeo
+        `[1:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1[capaescalada]`,
+        // Aplica ruído no vídeo original
+        `[0:v]${ruido}[vidcomruido]`,
+        // Overlay da capa apenas nos primeiros 0.3 segundos
+        `[vidcomruido][capaescalada]overlay=0:0:enable='between(t,0,0.3)'[final]`
+      ];
+
+      const outputOpts = [
+        '-map_metadata', '-1',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-b:v', targetBitrate + 'k',
+        '-async', '1',
+        '-vsync', '1',
+        '-movflags', '+faststart',
+        '-y'
+      ];
+
+      if (temAudio) {
+        outputOpts.push('-map', '0:a:0');
+        outputOpts.push('-c:a', 'aac');
+        outputOpts.push('-b:a', '96k');
+      } else {
+        outputOpts.push('-an');
+      }
 
       ffmpeg()
-        .input(inputPath)   // input 0: vídeo original (com áudio)
-        .input(capaPath)    // input 1: imagem de capa
-        .complexFilter(capaFiltro, 'out')
-        .outputOptions([
-          '-map', '[out]',    // vídeo processado com overlay
-          '-map', '0:a?',     // áudio do vídeo original
-          '-map_metadata', '-1',
-          '-c:v', 'libx264',
-          '-preset', 'ultrafast',
-          '-crf', String(crf),
-          '-c:a', 'aac',
-          '-b:a', '128k',
-          '-movflags', '+faststart',
-          '-y'
-        ])
-        .on('start', cmd => console.log('FFmpeg com capa overlay iniciado'))
+        .input(inputPath)
+        .input(capaPath)
+        .complexFilter(complexFilter, 'final')
+        .outputOptions(outputOpts)
+        .on('start', () => console.log('FFmpeg com capa overlay iniciado'))
         .on('progress', p => { if (p.percent) console.log(Math.round(p.percent) + '%'); })
         .on('end', resolve)
         .on('error', (err) => {
-          console.error('Erro overlay:', err.message);
-          // Fallback: processa sem capa se overlay falhar
-          console.log('Tentando sem capa como fallback...');
+          console.error('Erro overlay, tentando sem capa:', err.message);
           processarSemCapa(inputPath, outputPath, nivel).then(resolve).catch(reject);
         })
         .save(outputPath);
