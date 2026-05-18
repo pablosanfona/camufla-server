@@ -17,7 +17,6 @@ const OUTPUT_DIR = '/tmp/outputs';
 
 app.use(cors());
 app.use(express.json());
-
 app.use((req, res, next) => {
   req.setTimeout(600000);
   res.setTimeout(600000);
@@ -39,7 +38,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Camufla Server rodando!' });
 });
 
-// Processar vídeo e devolver o arquivo processado
+// Processar vídeo
 app.post('/processar', upload.fields([
   { name: 'video', maxCount: 1 },
   { name: 'capa',  maxCount: 1 }
@@ -73,7 +72,6 @@ app.post('/processar', upload.fields([
 
     console.log('Concluído:', outputName);
 
-    // Retorna o arquivo processado como download
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', 'attachment; filename="' + outputName + '"');
 
@@ -85,7 +83,7 @@ app.post('/processar', upload.fields([
       if (capaFile) limpar(capaFile.path);
     });
     stream.on('error', (err) => {
-      console.error('Erro no stream:', err.message);
+      console.error('Erro stream:', err.message);
       limpar(inputPath);
       limpar(outputPath);
       if (capaFile) limpar(capaFile.path);
@@ -102,9 +100,15 @@ app.post('/processar', upload.fields([
   }
 });
 
+// ============================================
+// Processar sem capa
+// FIX: mantém formato original + áudio correto
+// ============================================
 function processarSemCapa(inputPath, outputPath, nivel) {
   return new Promise((resolve, reject) => {
     const crf = nivel === 'basica' ? 28 : nivel === 'normal' ? 26 : 24;
+
+    // Filtro de ruído sem alterar resolução ou aspecto
     let filtros = 'noise=alls=1:allf=t';
     if (nivel === 'normal')    filtros = 'noise=alls=2:allf=t,hue=s=1.01';
     if (nivel === 'agressiva') filtros = 'noise=alls=3:allf=t,hue=s=1.02';
@@ -112,11 +116,14 @@ function processarSemCapa(inputPath, outputPath, nivel) {
     ffmpeg(inputPath)
       .videoFilters(filtros)
       .outputOptions([
+        '-map', '0:v:0',      // FIX: mapeia vídeo do input original
+        '-map', '0:a?',       // FIX: mapeia áudio do input original (? = opcional)
         '-map_metadata', '-1',
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-crf', String(crf),
-        '-c:a', 'copy',
+        '-c:a', 'aac',        // FIX: recodifica áudio em AAC compatível
+        '-b:a', '128k',
         '-movflags', '+faststart',
         '-y'
       ])
@@ -128,49 +135,86 @@ function processarSemCapa(inputPath, outputPath, nivel) {
   });
 }
 
+// ============================================
+// Processar com capa
+// FIX: mantém formato original + áudio correto
+// ============================================
 function processarComCapa(inputPath, outputPath, nivel, capaPath) {
   return new Promise((resolve, reject) => {
     const capaVideoPath = path.join(OUTPUT_DIR, 'capa_' + uuidv4() + '.mp4');
     const concatPath    = path.join(OUTPUT_DIR, 'concat_' + uuidv4() + '.txt');
 
-    ffmpeg(capaPath)
-      .loop(1)
-      .duration(1)
-      .outputOptions([
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-t', '1',
-        '-pix_fmt', 'yuv420p',
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-r', '30',
-        '-an', '-y'
-      ])
-      .on('end', function() {
-        fs.writeFileSync(concatPath, `file '${capaVideoPath}'\nfile '${inputPath}'`);
-        const crf = nivel === 'basica' ? 28 : nivel === 'normal' ? 26 : 24;
-        let filtros = 'noise=alls=1:allf=t';
-        if (nivel === 'normal')    filtros = 'noise=alls=2:allf=t,hue=s=1.01';
-        if (nivel === 'agressiva') filtros = 'noise=alls=3:allf=t,hue=s=1.02';
+    console.log('Criando capa...');
 
-        ffmpeg()
-          .input(concatPath)
-          .inputOptions(['-f', 'concat', '-safe', '0'])
-          .videoFilters(filtros)
-          .outputOptions([
-            '-map_metadata', '-1',
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', String(crf),
-            '-c:a', 'copy',
-            '-movflags', '+faststart',
-            '-y'
-          ])
-          .on('end', () => { limpar(capaVideoPath); limpar(concatPath); resolve(); })
-          .on('error', (err) => { limpar(capaVideoPath); limpar(concatPath); reject(err); })
-          .save(outputPath);
-      })
-      .on('error', reject)
-      .save(capaVideoPath);
+    // Passo 1: Detectar resolução do vídeo original
+    ffmpeg.ffprobe(inputPath, function(err, metadata) {
+      if (err) { reject(err); return; }
+
+      const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+      const width  = videoStream ? videoStream.width  : 1080;
+      const height = videoStream ? videoStream.height : 1920;
+
+      console.log('Resolução detectada:', width + 'x' + height);
+
+      // Passo 2: Criar capa com mesma resolução do vídeo original
+      ffmpeg(capaPath)
+        .loop(1)
+        .duration(1)
+        .outputOptions([
+          '-c:v', 'libx264',
+          '-preset', 'ultrafast',
+          '-t', '1',
+          '-pix_fmt', 'yuv420p',
+          // FIX: escala capa para a mesma resolução do vídeo original
+          '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
+          '-r', '30',
+          '-an',
+          '-y'
+        ])
+        .on('end', function() {
+          console.log('Capa criada, concatenando...');
+
+          fs.writeFileSync(concatPath,
+            `file '${capaVideoPath}'\nfile '${inputPath}'`
+          );
+
+          const crf = nivel === 'basica' ? 28 : nivel === 'normal' ? 26 : 24;
+          let filtros = 'noise=alls=1:allf=t';
+          if (nivel === 'normal')    filtros = 'noise=alls=2:allf=t,hue=s=1.01';
+          if (nivel === 'agressiva') filtros = 'noise=alls=3:allf=t,hue=s=1.02';
+
+          // Passo 3: Concatenar capa + vídeo com áudio correto
+          ffmpeg()
+            .input(concatPath)
+            .inputOptions(['-f', 'concat', '-safe', '0'])
+            .videoFilters(filtros)
+            .outputOptions([
+              '-map', '0:v:0',
+              '-map', '0:a?',
+              '-map_metadata', '-1',
+              '-c:v', 'libx264',
+              '-preset', 'ultrafast',
+              '-crf', String(crf),
+              '-c:a', 'aac',
+              '-b:a', '128k',
+              '-movflags', '+faststart',
+              '-y'
+            ])
+            .on('end', () => {
+              limpar(capaVideoPath);
+              limpar(concatPath);
+              resolve();
+            })
+            .on('error', (err) => {
+              limpar(capaVideoPath);
+              limpar(concatPath);
+              reject(err);
+            })
+            .save(outputPath);
+        })
+        .on('error', reject)
+        .save(capaVideoPath);
+    });
   });
 }
 
