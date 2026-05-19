@@ -12,7 +12,12 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-app.use(cors());
+// CORS CONFIGURADO - permite requisições do seu site
+app.use(cors({
+  origin: ['https://subdigital.site', 'http://localhost:3000'],
+  credentials: true
+}));
+
 app.use(express.json());
 
 // Técnicas otimizadas para usar MENOS memória
@@ -40,7 +45,7 @@ app.post('/processar', upload.fields([
 ]), async (req, res) => {
   console.log('[INICIO] Nova requisição');
   
-  let videoPath, capaPath, outputPath;
+  let videoPath, capaPath, outputPath, finalPath;
   
   try {
     if (!req.files || !req.files.video) {
@@ -114,7 +119,7 @@ app.post('/processar', upload.fields([
       console.log('[SUCESSO] Vídeo processado');
 
       // Limpar metadados (rápido, pouca RAM)
-      const finalPath = `/tmp/final_${Date.now()}.mp4`;
+      finalPath = `/tmp/final_${Date.now()}.mp4`;
       const metaArgs = [
         '-hide_banner',
         '-i', outputPath,
