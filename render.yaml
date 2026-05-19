@@ -2,13 +2,12 @@ services:
   - type: web
     name: camufla-server
     env: node
+    region: oregon
     plan: free
-    buildCommand: npm install
-    startCommand: node index.js
+    buildCommand: npm install && apt-get update && apt-get install -y ffmpeg
+    startCommand: npm start
     envVars:
-      - key: NODE_ENV
-        value: production
-    disk:
-      name: uploads
-      mountPath: /tmp/uploads
-      sizeGB: 1
+      - key: NODE_VERSION
+        value: 18.0.0
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=450
